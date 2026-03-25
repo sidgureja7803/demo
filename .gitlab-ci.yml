@@ -1,0 +1,113 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+stages:
+  - build
+  - deploy
+
+variables:
+  AWS_REGION: "us-west-2"
+  AWS_ACCOUNT_ID: "879753556751"
+
+  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+  ECR_BACKEND_REPO: "prodops-backend"
+  ECR_FRONTEND_REPO: "prodops-frontend"
+
+  CLUSTER_NAME: "prodops-platform-cluster"
+  BACKEND_SERVICE: "prodops-backend-svc"
+  FRONTEND_SERVICE: "prodops-frontend-svc"
+
+# -------------------------------
+# BUILD (KANIKO)
+# -------------------------------
+build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  script:
+    - |
+      set -e
+
+      IMAGE_TAG=${CI_COMMIT_SHORT_SHA}
+
+      BACKEND_IMAGE=${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
+      FRONTEND_IMAGE=${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}
+
+      echo "Building backend image..."
+      /kaniko/executor \
+        --context "${CI_PROJECT_DIR}/backend" \
+        --dockerfile "${CI_PROJECT_DIR}/backend/Dockerfile" \
+        --destination "${BACKEND_IMAGE}" \
+        --cache=true
+
+      echo "Building frontend image..."
+      /kaniko/executor \
+        --context "${CI_PROJECT_DIR}/frontend" \
+        --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile" \
+        --destination "${FRONTEND_IMAGE}" \
+        --cache=true
+
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# -------------------------------
+# DEPLOY (ECS)
+# -------------------------------
+deploy:
+  stage: deploy
+  image: amazon/aws-cli:2.15.0
+  before_script:
+    - yum install -y jq
+  script:
+    - |
+      set -e
+
+      IMAGE_TAG=${CI_COMMIT_SHORT_SHA}
+
+      BACKEND_IMAGE=${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
+      FRONTEND_IMAGE=${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}
+
+      echo "Updating backend task definition..."
+
+      aws ecs describe-task-definition \
+        --task-definition prodops-backend \
+        --query taskDefinition > backend.json
+
+      jq --arg IMAGE "$BACKEND_IMAGE" \
+      '.containerDefinitions[0].image = $IMAGE
+      | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+      backend.json > backend-new.json
+
+      aws ecs register-task-definition \
+        --cli-input-json file://backend-new.json
+
+      echo "Deploying backend..."
+      aws ecs update-service \
+        --cluster $CLUSTER_NAME \
+        --service $BACKEND_SERVICE \
+        --force-new-deployment
+
+      echo "Updating frontend task definition..."
+
+      aws ecs describe-task-definition \
+        --task-definition prodops-frontend \
+        --query taskDefinition > frontend.json
+
+      jq --arg IMAGE "$FRONTEND_IMAGE" \
+      '.containerDefinitions[0].image = $IMAGE
+      | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+      frontend.json > frontend-new.json
+
+      aws ecs register-task-definition \
+        --cli-input-json file://frontend-new.json
+
+      echo "Deploying frontend..."
+      aws ecs update-service \
+        --cluster $CLUSTER_NAME \
+        --service $FRONTEND_SERVICE \
+        --force-new-deployment
+
+      echo "Deployment completed successfully 🚀"
