@@ -3,9 +3,14 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "push"
 
 stages:
+  - lint
+  - test
   - build
   - deploy
 
+# -------------------------------
+# VARIABLES
+# -------------------------------
 variables:
   AWS_REGION: "us-west-2"
   AWS_ACCOUNT_ID: "879753556751"
@@ -18,40 +23,84 @@ variables:
   BACKEND_SERVICE: "prodops-backend-svc"
   FRONTEND_SERVICE: "prodops-frontend-svc"
 
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
 # -------------------------------
-# BUILD (KANIKO)
+# LINT
 # -------------------------------
-build:
-  stage: build
+backend-lint:
+  stage: lint
+  image: python:3.12-slim
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - ruff check .
+    - ruff format --check .
+
+frontend-lint:
+  stage: lint
+  image: node:20
+  script:
+    - cd frontend
+    - npm ci
+    - npm run lint
+
+# -------------------------------
+# TEST
+# -------------------------------
+backend-test:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - postgres:16-alpine
+    - redis:7-alpine
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - pytest
+
+frontend-test:
+  stage: test
+  image: node:20
+  script:
+    - cd frontend
+    - npm ci
+    - npm run test:ci
+
+# -------------------------------
+# BUILD + PUSH (KANIKO → ECR)
+# -------------------------------
+.build_template: &build_template
   image:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
+  before_script:
+    - echo "$CI_JOB_JWT_V2" > /tmp/web_identity_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web_identity_token
+    - export AWS_ROLE_ARN=$AWS_CONFIG_ROLE_ARN
+    - export AWS_DEFAULT_REGION=$AWS_REGION
+
+backend-build:
+  stage: build
+  <<: *build_template
   script:
     - |
-      set -e
-
-      IMAGE_TAG=${CI_COMMIT_SHORT_SHA}
-
-      BACKEND_IMAGE=${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
-      FRONTEND_IMAGE=${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}
-
-      echo "Building backend image..."
       /kaniko/executor \
         --context "${CI_PROJECT_DIR}/backend" \
         --dockerfile "${CI_PROJECT_DIR}/backend/Dockerfile" \
-        --destination "${BACKEND_IMAGE}" \
+        --destination "${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}" \
         --cache=true
 
-      echo "Building frontend image..."
+frontend-build:
+  stage: build
+  <<: *build_template
+  script:
+    - |
       /kaniko/executor \
         --context "${CI_PROJECT_DIR}/frontend" \
         --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile" \
-        --destination "${FRONTEND_IMAGE}" \
+        --destination "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}" \
         --cache=true
-
-  artifacts:
-    reports:
-      dotenv: build.env
 
 # -------------------------------
 # DEPLOY (ECS)
@@ -59,55 +108,68 @@ build:
 deploy:
   stage: deploy
   image: amazon/aws-cli:2.15.0
+  needs:
+    - backend-build
+    - frontend-build
   before_script:
     - yum install -y jq
+    - echo "$CI_JOB_JWT_V2" > /tmp/web_identity_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web_identity_token
+    - export AWS_ROLE_ARN=$AWS_CONFIG_ROLE_ARN
+    - export AWS_DEFAULT_REGION=$AWS_REGION
   script:
     - |
       set -e
 
-      IMAGE_TAG=${CI_COMMIT_SHORT_SHA}
+      BACKEND_IMAGE="${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}"
+      FRONTEND_IMAGE="${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}"
 
-      BACKEND_IMAGE=${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
-      FRONTEND_IMAGE=${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}
-
-      echo "Updating backend task definition..."
+      echo "Updating backend..."
 
       aws ecs describe-task-definition \
         --task-definition prodops-backend \
         --query taskDefinition > backend.json
 
-      jq --arg IMAGE "$BACKEND_IMAGE" \
-      '.containerDefinitions[0].image = $IMAGE
-      | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
-      backend.json > backend-new.json
+      jq --arg IMG "$BACKEND_IMAGE" \
+        '.containerDefinitions[0].image = $IMG
+        | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+        backend.json > backend-new.json
 
-      aws ecs register-task-definition \
-        --cli-input-json file://backend-new.json
+      BACKEND_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://backend-new.json \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
 
-      echo "Deploying backend..."
       aws ecs update-service \
         --cluster $CLUSTER_NAME \
         --service $BACKEND_SERVICE \
-        --force-new-deployment
+        --task-definition $BACKEND_ARN
 
-      echo "Updating frontend task definition..."
+      echo "Updating frontend..."
 
       aws ecs describe-task-definition \
         --task-definition prodops-frontend \
         --query taskDefinition > frontend.json
 
-      jq --arg IMAGE "$FRONTEND_IMAGE" \
-      '.containerDefinitions[0].image = $IMAGE
-      | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
-      frontend.json > frontend-new.json
+      jq --arg IMG "$FRONTEND_IMAGE" \
+        '.containerDefinitions[0].image = $IMG
+        | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+        frontend.json > frontend-new.json
 
-      aws ecs register-task-definition \
-        --cli-input-json file://frontend-new.json
+      FRONTEND_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://frontend-new.json \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
 
-      echo "Deploying frontend..."
       aws ecs update-service \
         --cluster $CLUSTER_NAME \
         --service $FRONTEND_SERVICE \
-        --force-new-deployment
+        --task-definition $FRONTEND_ARN
 
-      echo "Deployment completed successfully 🚀"
+      echo "Waiting for deployment..."
+
+      aws ecs wait services-stable \
+        --cluster $CLUSTER_NAME \
+        --services $BACKEND_SERVICE $FRONTEND_SERVICE
+
+      echo "Deployment successful 🚀"
