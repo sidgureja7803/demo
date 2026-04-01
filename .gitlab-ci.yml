@@ -1,175 +1,287 @@
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
 
 stages:
   - lint
   - test
-  - build
+  - prebuild
+  - package-lint
+  - package-build
+  - package-test
+  - publish
   - deploy
 
-# -------------------------------
-# VARIABLES
-# -------------------------------
-variables:
-  AWS_REGION: "us-west-2"
-  AWS_ACCOUNT_ID: "879753556751"
+include:
+  - component: "$CI_SERVER_FQDN/to-be-continuous/docker/gitlab-ci-docker@6.1"
+    inputs:
+      file: "$DOCKER_FILE"
+      release-image: "$AWS_CONFIG_RELEASE_IMAGE:$BUILD_TAG"
+      prod-publish-strategy: "auto"
+      semrel-release-disabled: true
+      registry-mirror: "${NEXUS_PROXY}"
+      hadolint-image: "${NEXUS_PROXY}/hadolint/hadolint:latest-alpine"
+      healthcheck-disabled: true
+      trivy-image: "${NEXUS_PROXY}/aquasec/trivy:latest"
+      sbom-image: "${NEXUS_PROXY}/anchore/syft:debug"
+  - component: "$CI_SERVER_FQDN/to-be-continuous/docker/gitlab-ci-docker-ecr@6.1"
+    inputs:
+      aws-region: $AWS_CONFIG_REGION
+      aws-oidc-role-arn: $AWS_CONFIG_ROLE_ARN
 
-  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+variables:
+  AWS_ACCOUNT_ID: "879753556751"
+  AWS_ENDPOINT_URL_STS: "https://sts.us-west-2.amazonaws.com"
+  BUILD_TAG: "$CI_COMMIT_SHORT_SHA"
+  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_CONFIG_REGION}.amazonaws.com"
   ECR_BACKEND_REPO: "prodops-backend"
   ECR_FRONTEND_REPO: "prodops-frontend"
-
   CLUSTER_NAME: "prodops-platform-cluster"
   BACKEND_SERVICE: "prodops-backend-svc"
   FRONTEND_SERVICE: "prodops-frontend-svc"
+  BACKEND_CONTAINER_NAME: "backend"
+  FRONTEND_CONTAINER_NAME: "frontend"
+  NEXUS_DOCKERHUB: "${NEXUS_PROXY}/library"
+  BACKEND_BASE_IMAGE: "${NEXUS_DOCKERHUB}/python:3.12-slim"
+  FRONTEND_BASE_IMAGE: "${NEXUS_DOCKERHUB}/node:20-alpine"
 
-  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+cache:
+  paths:
+    - .cache/pip/
 
-# -------------------------------
-# LINT
-# -------------------------------
+.python_job: &python_job
+  image: "${NEXUS_PROXY}/library/python:3.12-slim"
+  before_script:
+    - python3 -m pip install --upgrade pip setuptools wheel
+
+.node_job: &node_job
+  image: "${NEXUS_PROXY}/library/node:20-bookworm-slim"
+  cache:
+    key:
+      files:
+        - frontend/package-lock.json
+    paths:
+      - frontend/.npm/
+    policy: pull-push
+  before_script:
+    - cd "$CI_PROJECT_DIR/frontend"
+    - npm ci --prefer-offline --no-audit --no-fund
+
 backend-lint:
+  <<: *python_job
   stage: lint
-  image: python:3.12-slim
   script:
     - cd backend
-    - pip install -r requirements-dev.txt
+    - python3 -m pip install -r requirements-dev.txt
     - ruff check .
     - ruff format --check .
 
 frontend-lint:
+  <<: *node_job
   stage: lint
-  image: node:20
   script:
-    - cd frontend
-    - npm ci
     - npm run lint
 
-# -------------------------------
-# TEST
-# -------------------------------
-backend-test:
+backend-unit-tests:
+  <<: *python_job
   stage: test
-  image: python:3.12-slim
+  variables:
+    DATABASE_URL: "postgresql://pop:pop_secret@postgres:5432/pop_db"
+    REDIS_URL: "redis://redis:6379/0"
+    POSTGRES_DB: pop_db
+    POSTGRES_USER: pop
+    POSTGRES_PASSWORD: pop_secret
+    ENVIRONMENT: test
+    DEV_MODE: "true"
+    POSTGRES_HOST_AUTH_METHOD: "trust"
   services:
-    - postgres:16-alpine
-    - redis:7-alpine
+    - name: postgres:16-alpine
+      alias: postgres
+    - name: redis:7-alpine
+      alias: redis
   script:
     - cd backend
-    - pip install -r requirements-dev.txt
-    - pytest
+    - python3 -m pip install -r requirements-dev.txt
+    - python3 -m pytest --junitxml=report.xml --cov=src/ --cov-report=term --cov-report=xml:coverage.xml
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+    paths:
+      - backend/report.xml
+      - backend/coverage.xml
 
-frontend-test:
+frontend-tests:
+  <<: *node_job
   stage: test
-  image: node:20
   script:
-    - cd frontend
-    - npm ci
+    - npm run typecheck
     - npm run test:ci
+  artifacts:
+    when: always
+    paths:
+      - frontend/coverage/
 
-# -------------------------------
-# BUILD + PUSH (KANIKO → ECR)
-# -------------------------------
-.build_template: &build_template
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
-  before_script:
-    - echo "$CI_JOB_JWT_V2" > /tmp/web_identity_token
-    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web_identity_token
-    - export AWS_ROLE_ARN=$AWS_CONFIG_ROLE_ARN
-    - export AWS_DEFAULT_REGION=$AWS_REGION
-
-backend-build:
-  stage: build
-  <<: *build_template
-  script:
-    - |
-      /kaniko/executor \
-        --context "${CI_PROJECT_DIR}/backend" \
-        --dockerfile "${CI_PROJECT_DIR}/backend/Dockerfile" \
-        --destination "${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}" \
-        --cache=true
-
-frontend-build:
-  stage: build
-  <<: *build_template
-  script:
-    - |
-      /kaniko/executor \
-        --context "${CI_PROJECT_DIR}/frontend" \
-        --dockerfile "${CI_PROJECT_DIR}/frontend/Dockerfile" \
-        --destination "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}" \
-        --cache=true
-
-# -------------------------------
-# DEPLOY (ECS)
-# -------------------------------
-deploy:
-  stage: deploy
+.aws-oidc-base:
   image: amazon/aws-cli:2.15.0
-  needs:
-    - backend-build
-    - frontend-build
+  variables:
+    GIT_STRATEGY: none
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://$CI_SERVER_FQDN
   before_script:
-    - yum install -y jq
-    - echo "$CI_JOB_JWT_V2" > /tmp/web_identity_token
-    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web_identity_token
-    - export AWS_ROLE_ARN=$AWS_CONFIG_ROLE_ARN
-    - export AWS_DEFAULT_REGION=$AWS_REGION
+    - |
+      set -euo pipefail
+      yum install -y jq >/dev/null
+      : "${AWS_CONFIG_REGION:?AWS_CONFIG_REGION must be set}"
+      : "${AWS_CONFIG_ROLE_ARN:?AWS_CONFIG_ROLE_ARN must be set}"
+      read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_CONFIG_ROLE_ARN" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+        --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      export AWS_ACCESS_KEY_ID
+      export AWS_SECRET_ACCESS_KEY
+      export AWS_SESSION_TOKEN
+      export AWS_REGION="$AWS_CONFIG_REGION"
+      export AWS_DEFAULT_REGION="$AWS_CONFIG_REGION"
+      aws sts get-caller-identity --output json
+
+aws-oidc-validate:
+  extends: .aws-oidc-base
+  stage: prebuild
+  script:
+    - aws ecr describe-repositories --repository-names "$ECR_BACKEND_REPO" "$ECR_FRONTEND_REPO" --output table
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+.docker-base:
+  needs:
+    - backend-unit-tests
+    - frontend-tests
+    - aws-oidc-validate
+  variables:
+    DOCKER_REGISTRY_SNAPSHOT_USER: "$CI_REGISTRY_USER"
+    DOCKER_REGISTRY_SNAPSHOT_PASSWORD: "$CI_REGISTRY_PASSWORD"
+  parallel:
+    matrix:
+      - DOCKER_ARTIFACTS_NAMESPACE: "backend"
+        DOCKER_FILE: "backend/Dockerfile"
+        DOCKER_CONTEXT_PATH: "backend"
+        AWS_CONFIG_RELEASE_IMAGE: "${ECR_REGISTRY}/${ECR_BACKEND_REPO}"
+        DOCKER_BUILD_ARGS: "--build-arg PYTHON_BASE_IMAGE=${BACKEND_BASE_IMAGE}"
+      - DOCKER_ARTIFACTS_NAMESPACE: "frontend"
+        DOCKER_FILE: "frontend/Dockerfile"
+        DOCKER_CONTEXT_PATH: "frontend"
+        AWS_CONFIG_RELEASE_IMAGE: "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}"
+        DOCKER_BUILD_ARGS: "--build-arg NODE_BASE_IMAGE=${FRONTEND_BASE_IMAGE}"
+
+docker-hadolint:
+  stage: package-lint
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+docker-kaniko-build:
+  stage: package-build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+docker-healthcheck:
+  stage: package-test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+docker-trivy:
+  stage: package-test
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+docker-sbom:
+  stage: package-test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+docker-publish:
+  stage: publish
+  variables:
+    GIT_STRATEGY: none
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
+
+.deploy_ecs_base:
+  extends: .aws-oidc-base
+  stage: deploy
   script:
     - |
-      set -e
+      set -euo pipefail
+      NEW_IMAGE="$DEPLOY_IMAGE"
+      SERVICE_NAME="$DEPLOY_SERVICE_NAME"
+      CONTAINER_NAME="$DEPLOY_CONTAINER_NAME"
+      TASKDEF_FILE="${CI_JOB_NAME}-taskdef.json"
+      TASKDEF_RENDERED_FILE="${CI_JOB_NAME}-taskdef-rendered.json"
 
-      BACKEND_IMAGE="${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}"
-      FRONTEND_IMAGE="${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}"
-
-      echo "Updating backend..."
-
-      aws ecs describe-task-definition \
-        --task-definition prodops-backend \
-        --query taskDefinition > backend.json
-
-      jq --arg IMG "$BACKEND_IMAGE" \
-        '.containerDefinitions[0].image = $IMG
-        | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
-        backend.json > backend-new.json
-
-      BACKEND_ARN=$(aws ecs register-task-definition \
-        --cli-input-json file://backend-new.json \
-        --query 'taskDefinition.taskDefinitionArn' \
-        --output text)
-
-      aws ecs update-service \
-        --cluster $CLUSTER_NAME \
-        --service $BACKEND_SERVICE \
-        --task-definition $BACKEND_ARN
-
-      echo "Updating frontend..."
+      TD_ARN="$(aws ecs describe-services \
+        --cluster "$CLUSTER_NAME" \
+        --services "$SERVICE_NAME" \
+        --query 'services[0].taskDefinition' \
+        --output text)"
 
       aws ecs describe-task-definition \
-        --task-definition prodops-frontend \
-        --query taskDefinition > frontend.json
+        --task-definition "$TD_ARN" \
+        --query taskDefinition > "$TASKDEF_FILE"
 
-      jq --arg IMG "$FRONTEND_IMAGE" \
-        '.containerDefinitions[0].image = $IMG
-        | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
-        frontend.json > frontend-new.json
+      jq --arg IMG "$NEW_IMAGE" --arg NAME "$CONTAINER_NAME" '
+        del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+        | .containerDefinitions |= map(if .name == $NAME then .image = $IMG else . end)
+      ' "$TASKDEF_FILE" > "$TASKDEF_RENDERED_FILE"
 
-      FRONTEND_ARN=$(aws ecs register-task-definition \
-        --cli-input-json file://frontend-new.json \
+      NEW_TD_ARN="$(aws ecs register-task-definition \
+        --cli-input-json "file://$TASKDEF_RENDERED_FILE" \
         --query 'taskDefinition.taskDefinitionArn' \
-        --output text)
+        --output text)"
 
       aws ecs update-service \
-        --cluster $CLUSTER_NAME \
-        --service $FRONTEND_SERVICE \
-        --task-definition $FRONTEND_ARN
-
-      echo "Waiting for deployment..."
+        --cluster "$CLUSTER_NAME" \
+        --service "$SERVICE_NAME" \
+        --task-definition "$NEW_TD_ARN"
 
       aws ecs wait services-stable \
-        --cluster $CLUSTER_NAME \
-        --services $BACKEND_SERVICE $FRONTEND_SERVICE
+        --cluster "$CLUSTER_NAME" \
+        --services "$SERVICE_NAME"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - when: never
 
-      echo "Deployment successful 🚀"
+deploy-backend:
+  extends: .deploy_ecs_base
+  variables:
+    DEPLOY_IMAGE: "${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${BUILD_TAG}"
+    DEPLOY_SERVICE_NAME: "$BACKEND_SERVICE"
+    DEPLOY_CONTAINER_NAME: "$BACKEND_CONTAINER_NAME"
+
+deploy-frontend:
+  extends: .deploy_ecs_base
+  variables:
+    DEPLOY_IMAGE: "${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${BUILD_TAG}"
+    DEPLOY_SERVICE_NAME: "$FRONTEND_SERVICE"
+    DEPLOY_CONTAINER_NAME: "$FRONTEND_CONTAINER_NAME"
