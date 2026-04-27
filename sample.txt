@@ -1,0 +1,56 @@
+Lets, build the dummy data for the innovation feed
+so what the flow is ->
+
+Innovation Feed (in this project) — what it is
+Innovation Feed is a UI page that shows a chronological feed of product/engineering “milestone” updates pulled from Jira (via Snowflake → ETL → Postgres). Think of it as an “updates/news feed” for initiatives/issues, filtered by month and other attributes.
+
+What we display (per feed item)
+Each row/item in the feed corresponds to an InnovationFeedItem in Postgres, and the UI typically displays:
+
+Issue key (e.g., Jira ticket key)
+Milestone type (the kind of milestone/update)
+Month (used for time-window filtering)
+Product / product category
+Tier / health
+Summary + Description   - It exposes both:     - source_summary/source_description: original text from Snowflake/Jira (stored in sf_data)     - summary/description: what UI should show (local refined text overrides source if present)
+Updated timestamp (rds_modified_at) used for ordering the feed (“most recently updated first”)
+Optional extra fields like expected milestone date, PI type, milestone reached, etc.
+It’s designed so users can quickly see what changed recently (based on an “updated” timestamp), and click into an item for more detail.
+
+What is “local editing” and how it works
+Innovation Feed supports local-only edits (without changing Jira/Snowflake):
+
+The UI can PATCH an item:   - PATCH /pop/api/apps/innovation-feed/{issue_key}/{milestone_type}
+These edits are stored in local_data JSON in Postgres.
+The UI displays:   - summary/description = local refined text if present, otherwise the source text.
+When you PATCH, backend updates:   - local_modified_at   - rds_modified_at So the edited item rises in the feed because sorting is by rds_modified_at.
+There’s also an endpoint to “enhance summary” (currently placeholder logic) that saves enhanced_summary into local_data.
+
+How the UI fetches it (what your page.tsx is doing)
+Your innovation-feed/page.tsx:
+
+computes a date window:   - fromMonth = current month start (YYYY-MM-01)   - toMonth = start of month + 2 months (inclusive)
+calls fetchInnovationFeed({ fromMonth, toMonth })
+renders InnovationFeedClient with:   - initialItems   - total
+Now, since i am facing issues
+lets build this with dummy data only, i am proviidng you the screenshots, page.tsx file
+should match the screenshots, as closely as possoible, right
+
+the product categories are - Platform Experience
+Data Security
+Zero Trust Users
+SecOps
+Platform
+AI Security
+Data Fabric
+Unified Experience
+Zero Trust Branch
+Zero Trust Cloud
+Engineering Uplift
+
+I am providing you the csv file, as well
+so make sure, the page looks real, we are showing dummy data, but yes, it should look real as much as possible, go ahead and build this page.tsx, as per the requirements, but with dummy data only.
+
+
+
+

@@ -1,0 +1,66 @@
+PRODUCT_CATEGORY,PRODUCT
+AI Security,AI Asset Management
+AI Security,AI Guard
+AI Security,AI Innovations
+AI Security,Public AI
+Data Fabric,Lakehouse & Data Platform
+Data Fabric,SecOps App Infrastructure
+Data Fabric,SecOps Platform
+Data Security,API-CASB
+Data Security,Cloud App Control
+Data Security,Core DLP
+Data Security,DSPM
+Data Security,Email DLP
+Data Security,Endpoint DLP
+Data Security,Multi-Mode CASB
+Data Security,OOB CASB
+Data Security,SSPM
+Data Security,SaaS Security
+Data Security,Web DLP
+Data Security,Zscaler Workflow Automation (ZWA)
+Engineering Uplift,Engineering Uplift
+Platform,Authentication Service
+Platform,Business Continuity Cloud
+Platform,Client Connector
+Platform,OneAPI
+Platform,Unified UX - Experience Center
+Platform,Z4Z
+Platform Experience,Authentication Service
+Platform Experience,Business Continuity Cloud
+Platform Experience,Business Insights
+Platform Experience,CXO App
+Platform Experience,Client Connector
+Platform Experience,Federal Clouds - Public Sector
+Platform Experience,Health360
+Platform Experience,Logging and Streaming Service
+Platform Experience,Multi-Tenant Management Portal (MTMP)
+Platform Experience,OneAPI
+Platform Experience,Risk360
+Platform Experience,Sovereign Cloud
+Platform Experience,Unified RBAC
+Platform Experience,Z4Z
+Platform Experience,ZSCM
+Platform Experience,Zscaler Provisioning Service
+SecOps,Asset Exposure Management
+SecOps,Deception
+SecOps,External Attack Surface Management
+SecOps,Identity Protection
+SecOps,SOC Workbench
+SecOps,Unified Vulnerability Management
+SecOps,Zscaler Threat Hunting
+Unified Experience,QBR
+Unified Experience,UX Design & Research
+Unified Experience,Unified UX - Experience Center
+Zero Trust Branch,Privileged Remote Access
+Zero Trust Branch,Zero Trust Branch - SD-WAN
+Zero Trust Cloud,ZT Cloud - Microsegmentation
+Zero Trust Cloud,ZT Cloud - ZTGW - CC
+Zero Trust Users,Business Continuity Cloud
+Zero Trust Users,Cloud Sandbox & ATP
+Zero Trust Users,Digital Experience (ZDX)
+Zero Trust Users,Secure Internet Access (ZIA)
+Zero Trust Users,Secure Private Access (ZPA)
+Zero Trust Users,ZSDK
+Zero Trust Users,Zero Trust Browser
+Zero Trust Users,Zero Trust Firewall
+Zero Trust Users,Zscaler Cellular
